@@ -1,7 +1,12 @@
 PREFIX ?= /usr/local
 BIN     = xib
 
-CFLAGS  ?= -O2
+# clang by default unless the user picked a compiler or flags.
+ifeq ($(origin CC),default)
+CC := clang
+endif
+
+CFLAGS  ?= -O3
 CFLAGS  += -std=c11 -Wall -Wextra -Wno-unused-parameter
 PKGS     = cairo xcb xcb-render xcb-shape
 CPPFLAGS += $(shell pkg-config --cflags $(PKGS))

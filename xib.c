@@ -1,6 +1,6 @@
 /* xib - image based window borders for X11
  *
- * Draws an override-redirect ARGB frame window directly below every managed
+ * Draws an override-redirect ARGB frame window directly above every managed
  * client and paints a 9-slice PNG ring around it. Needs a compositor.
  */
 
@@ -642,7 +642,7 @@ static int class_excluded(xcb_window_t win)
     int off = 0, excluded = 0;
     while (off < len) {
         size_t sl = strnlen(p + off, (size_t)(len - off));
-        for (int i = 0; exclude_classes[i]; i++) {
+        for (size_t i = 0; i < sizeof exclude_classes / sizeof *exclude_classes; i++) {
             if (strcmp(p + off, exclude_classes[i]) == 0)
                 excluded = 1;
         }
@@ -747,20 +747,80 @@ static void set_rgba(cairo_t *cr, uint32_t argb)
                           ((argb >> 24) & 0xff) / 255.0);
 }
 
-static void draw_patch(cairo_t *cr, cairo_surface_t *src, int sx, int sy, int sw, int sh,
-                       int dx, int dy, int dw, int dh, int tile)
-{
-    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0)
-        return;
+/* One cached 9-slice patch: the pattern used to fill a destination rect.
+ * Patterns depend only on the source image and the rect geometry, so they are
+ * cached and reused while a client stays at the same size. */
+typedef struct {
+    cairo_surface_t *src;
+    cairo_pattern_t *pat;
+    cairo_surface_t *sub;   /* tiled source patch, referenced by pat */
+    int sx, sy, sw, sh;     /* source rect */
+    int dx, dy, dw, dh;     /* destination rect */
+    int tile;
+} nine_slot_t;
 
-    cairo_save(cr);
-    cairo_rectangle(cr, dx, dy, dw, dh);
-    cairo_clip(cr);
+/* Patterns for one (image, frame size) pair; the 8 patches of a 9-slice.
+ * A handful of entries covers the common case of a few clients at different
+ * sizes. */
+typedef struct {
+    cairo_surface_t *src;
+    int fw, fh;
+    nine_slot_t slots[8];
+    unsigned seq;
+} nine_cache_t;
+
+#define NINE_CACHE_ENTRIES 4
+static nine_cache_t nine_cache[NINE_CACHE_ENTRIES];
+static unsigned nine_cache_seq;
+static nine_cache_t *nine_cur;
+
+static void nine_slot_destroy(nine_slot_t *s)
+{
+    if (s->pat) {
+        cairo_pattern_destroy(s->pat);
+        if (s->sub)
+            cairo_surface_destroy(s->sub);
+        s->pat = NULL;
+        s->sub = NULL;
+    }
+}
+
+static nine_cache_t *nine_cache_get(cairo_surface_t *src, int fw, int fh)
+{
+    nine_cache_t *oldest = &nine_cache[0];
+    for (int i = 0; i < NINE_CACHE_ENTRIES; i++) {
+        nine_cache_t *c = &nine_cache[i];
+        if (c->src == src && c->fw == fw && c->fh == fh)
+            return c;
+        if (c->seq < oldest->seq)
+            oldest = c;
+    }
+    nine_cache_t *c = oldest;
+    for (int i = 0; i < 8; i++)
+        nine_slot_destroy(&c->slots[i]);
+    c->src = src;
+    c->fw = fw;
+    c->fh = fh;
+    c->seq = ++nine_cache_seq;
+    return c;
+}
+
+static cairo_pattern_t *nine_slot_pattern(int i, cairo_surface_t *src,
+                                          int sx, int sy, int sw, int sh,
+                                          int dx, int dy, int dw, int dh, int tile)
+{
+    nine_slot_t *s = &nine_cur->slots[i];
+    if (s->pat && s->src == src &&
+        s->sx == sx && s->sy == sy && s->sw == sw && s->sh == sh &&
+        s->dx == dx && s->dy == dy && s->dw == dw && s->dh == dh &&
+        s->tile == tile)
+        return s->pat;
+
+    nine_slot_destroy(s);
 
     cairo_surface_t *sub = NULL;
-    cairo_pattern_t *pat;
     cairo_matrix_t m;
-
+    cairo_pattern_t *pat;
     if (tile) {
         sub = cairo_surface_create_for_rectangle(src, sx, sy, sw, sh);
         pat = cairo_pattern_create_for_surface(sub);
@@ -774,12 +834,27 @@ static void draw_patch(cairo_t *cr, cairo_surface_t *src, int sx, int sy, int sw
     }
     cairo_pattern_set_filter(pat, CAIRO_FILTER_BILINEAR);
     cairo_pattern_set_matrix(pat, &m);
+
+    s->pat = pat;
+    s->sub = sub;
+    s->src = src;
+    s->sx = sx; s->sy = sy; s->sw = sw; s->sh = sh;
+    s->dx = dx; s->dy = dy; s->dw = dw; s->dh = dh;
+    s->tile = tile;
+    return pat;
+}
+
+static void draw_patch(cairo_t *cr, int idx, cairo_surface_t *src,
+                       int sx, int sy, int sw, int sh,
+                       int dx, int dy, int dw, int dh, int tile)
+{
+    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0)
+        return;
+    cairo_pattern_t *pat = nine_slot_pattern(idx, src, sx, sy, sw, sh,
+                                             dx, dy, dw, dh, tile);
+    cairo_rectangle(cr, dx, dy, dw, dh);
     cairo_set_source(cr, pat);
-    cairo_paint(cr);
-    cairo_pattern_destroy(pat);
-    if (sub)
-        cairo_surface_destroy(sub);
-    cairo_restore(cr);
+    cairo_fill(cr);
 }
 
 static void draw_nine_slice(cairo_t *cr, cairo_surface_t *img, edges_t e,
@@ -802,21 +877,23 @@ static void draw_nine_slice(cairo_t *cr, cairo_surface_t *img, edges_t e,
     if (inner_w < 0 || inner_h < 0)
         return;
 
+    nine_cur = nine_cache_get(img, fw, fh);
+
     /* Each source corner matches its own side's width/height. */
-    draw_patch(cr, img, 0, 0, sl, st, 0, 0, e.left, e.top, 0);
-    draw_patch(cr, img, iw - sr, 0, sr, st, fw - e.right, 0, e.right, e.top, 0);
-    draw_patch(cr, img, 0, ih - sb, sl, sb, 0, fh - e.bottom, e.left, e.bottom, 0);
-    draw_patch(cr, img, iw - sr, ih - sb, sr, sb,
+    draw_patch(cr, 0, img, 0, 0, sl, st, 0, 0, e.left, e.top, 0);
+    draw_patch(cr, 1, img, iw - sr, 0, sr, st, fw - e.right, 0, e.right, e.top, 0);
+    draw_patch(cr, 2, img, 0, ih - sb, sl, sb, 0, fh - e.bottom, e.left, e.bottom, 0);
+    draw_patch(cr, 3, img, iw - sr, ih - sb, sr, sb,
                fw - e.right, fh - e.bottom, e.right, e.bottom, 0);
 
     /* Edge strips between the corners. */
-    draw_patch(cr, img, sl, 0, iw - sl - sr, st,
+    draw_patch(cr, 4, img, sl, 0, iw - sl - sr, st,
                e.left, 0, inner_w, e.top, edge_mode);
-    draw_patch(cr, img, sl, ih - sb, iw - sl - sr, sb,
+    draw_patch(cr, 5, img, sl, ih - sb, iw - sl - sr, sb,
                e.left, fh - e.bottom, inner_w, e.bottom, edge_mode);
-    draw_patch(cr, img, 0, st, sl, ih - st - sb,
+    draw_patch(cr, 6, img, 0, st, sl, ih - st - sb,
                0, e.top, e.left, inner_h, edge_mode);
-    draw_patch(cr, img, iw - sr, st, sr, ih - st - sb,
+    draw_patch(cr, 7, img, iw - sr, st, sr, ih - st - sb,
                fw - e.right, e.top, e.right, inner_h, edge_mode);
 }
 
@@ -916,14 +993,16 @@ static void present(client_t *c)
         render_frame(c);
     if (!c->pixmap)
         return;
-    xcb_void_cookie_t cookie =
-        xcb_copy_area_checked(conn, c->pixmap, c->frame, gc, 0, 0, 0, 0, c->w, c->h);
     if (debug_enabled) {
+        xcb_void_cookie_t cookie =
+            xcb_copy_area_checked(conn, c->pixmap, c->frame, gc, 0, 0, 0, 0, c->w, c->h);
         xcb_generic_error_t *err = xcb_request_check(conn, cookie);
         if (err) {
             DBG("copy_area failed: X error %d\n", err->error_code);
             free(err);
         }
+    } else {
+        xcb_copy_area(conn, c->pixmap, c->frame, gc, 0, 0, 0, 0, c->w, c->h);
     }
 }
 
@@ -1154,6 +1233,10 @@ static void reload_images(void)
             cairo_surface_destroy(img_unfocused);
         img_unfocused = u;
     }
+    /* Drop patterns bound to the old image surfaces. */
+    for (int i = 0; i < NINE_CACHE_ENTRIES; i++)
+        for (int j = 0; j < 8; j++)
+            nine_slot_destroy(&nine_cache[i].slots[j]);
     mark_all_stale();
 }
 
