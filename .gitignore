@@ -3,3 +3,4 @@ assets/
 skills-lock.json
 src/
 *.pkg.tar.*
+*.tar.gz
