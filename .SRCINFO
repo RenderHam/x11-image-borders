@@ -1,0 +1,16 @@
+pkgbase = xib
+	pkgdesc = X11 daemon drawing 9-slice PNG borders around managed windows
+	pkgver = 1.0
+	pkgrel = 1
+	url = https://github.com/RenderHam/x11-image-borders
+	arch = x86_64
+	arch = aarch64
+	makedepends = clang
+	makedepends = make
+	makedepends = pkgconf
+	depends = cairo
+	depends = libxcb
+	source = https://github.com/RenderHam/x11-image-borders/archive/refs/tags/v1.0.tar.gz
+	sha256sums = 075b5b57c63a988b3d50e84ea1a7dfaad746996ba97ddca3cb50e61bd9d132ab
+
+pkgname = xib

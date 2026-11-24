@@ -1,3 +1,5 @@
 assets/
 .agents/
 skills-lock.json
+src/
+*.pkg.tar.*
