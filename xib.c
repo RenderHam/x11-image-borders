@@ -342,8 +342,8 @@ static void ensure_assets(void)
     for (size_t i = 0; i < N_HUD_TEMPLATE_SIZES; i++) {
         int s = hud_template_sizes[i];
         char nf[64], nu[64];
-        snprintf(nf, sizeof nf, "hud-%d-focused.png", s);
-        snprintf(nu, sizeof nu, "hud-%d-unfocused.png", s);
+        snprintf(nf, sizeof nf, "hud-%d-focused-white.png", s);
+        snprintf(nu, sizeof nu, "hud-%d-unfocused-black.png", s);
         if (!write_hud_pair(dir, nf, nu, s))
             fprintf(stderr, "xib: failed to generate %s\n", nf);
         if (s == size) {
@@ -415,8 +415,8 @@ static int gen_assets(int n, char **args)
 
     for (int i = 0; i < count; i++) {
         char nf[64], nu[64], path[PATH_MAX];
-        snprintf(nf, sizeof nf, "hud-%d-focused.png", sizes[i]);
-        snprintf(nu, sizeof nu, "hud-%d-unfocused.png", sizes[i]);
+        snprintf(nf, sizeof nf, "hud-%d-focused-white.png", sizes[i]);
+        snprintf(nu, sizeof nu, "hud-%d-unfocused-black.png", sizes[i]);
         if (!write_hud_pair(dir, nf, nu, sizes[i])) {
             free(dir);
             return 1;
@@ -430,8 +430,8 @@ static int gen_assets(int n, char **args)
     if (count == 1) {
         int size = sizes[0];
         char nf[64], nu[64];
-        snprintf(nf, sizeof nf, "hud-%d-focused.png", size);
-        snprintf(nu, sizeof nu, "hud-%d-unfocused.png", size);
+        snprintf(nf, sizeof nf, "hud-%d-focused-white.png", size);
+        snprintf(nu, sizeof nu, "hud-%d-unfocused-black.png", size);
         printf("xib: use it with:\n"
                "  focused_image   = \"%s/%s\";\n"
                "  unfocused_image = \"%s/%s\";\n"
@@ -543,12 +543,11 @@ static client_t *client_new(void)
     return c;
 }
 
-static int get_atoms(xcb_window_t win, xcb_atom_t prop, xcb_atom_t **out, int *count)
+static int get_atoms_reply(xcb_get_property_cookie_t ck, xcb_atom_t **out, int *count)
 {
     *out = NULL;
     *count = 0;
-    xcb_get_property_reply_t *r =
-        xcb_get_property_reply(conn, xcb_get_property(conn, 0, win, prop, XCB_ATOM_ATOM, 0, 1024), NULL);
+    xcb_get_property_reply_t *r = xcb_get_property_reply(conn, ck, NULL);
     if (!r)
         return 0;
     if (r->format == 32) {
@@ -617,24 +616,30 @@ static xcb_window_t read_active_window(void)
     return w;
 }
 
-static int has_state(xcb_window_t win, xcb_atom_t state)
+static int state_has_any(xcb_get_property_cookie_t ck, const xcb_atom_t *states, int n)
 {
     xcb_atom_t *list;
-    int n;
-    if (!get_atoms(win, atoms[A_NET_WM_STATE], &list, &n))
-        return 0;
-    int found = 0;
-    for (int i = 0; i < n; i++)
-        if (list[i] == state)
-            found = 1;
-    free(list);
+    int count, found = 0;
+    if (get_atoms_reply(ck, &list, &count)) {
+        for (int i = 0; i < count && !found; i++)
+            for (int j = 0; j < n; j++)
+                if (list[i] == states[j])
+                    found = 1;
+        free(list);
+    }
     return found;
 }
 
-static int class_excluded(xcb_window_t win)
+static int has_state(xcb_window_t win, xcb_atom_t state)
 {
-    xcb_get_property_reply_t *r = xcb_get_property_reply(
-        conn, xcb_get_property(conn, 0, win, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 0, 256), NULL);
+    return state_has_any(xcb_get_property(conn, 0, win, atoms[A_NET_WM_STATE],
+                                          XCB_ATOM_ATOM, 0, 1024),
+                         &state, 1);
+}
+
+static int class_excluded_ck(xcb_get_property_cookie_t ck)
+{
+    xcb_get_property_reply_t *r = xcb_get_property_reply(conn, ck, NULL);
     if (!r)
         return 0;
     int len = xcb_get_property_value_length(r);
@@ -654,11 +659,11 @@ static int class_excluded(xcb_window_t win)
     return excluded;
 }
 
-static int type_allowed(xcb_window_t win)
+static int type_allowed_ck(xcb_get_property_cookie_t ck)
 {
     xcb_atom_t *list;
     int n;
-    if (!get_atoms(win, atoms[A_NET_WM_WINDOW_TYPE], &list, &n))
+    if (!get_atoms_reply(ck, &list, &n))
         return 1;
     if (n == 0) {
         free(list);
@@ -1077,22 +1082,34 @@ static void add_client(xcb_window_t win)
     if (find_client(win) || is_our_frame(win))
         return;
 
-    xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(
-        conn, xcb_get_window_attributes(conn, win), NULL);
+    /* Fire all queries before reading any reply so the roundtrips overlap
+     * while windows open during a storm. */
+    xcb_get_window_attributes_cookie_t a_ck = xcb_get_window_attributes(conn, win);
+    xcb_get_geometry_cookie_t g_ck = xcb_get_geometry(conn, win);
+    xcb_translate_coordinates_cookie_t tr_ck =
+        xcb_translate_coordinates(conn, win, screen->root, 0, 0);
+    xcb_get_property_cookie_t st_ck =
+        xcb_get_property(conn, 0, win, atoms[A_NET_WM_STATE], XCB_ATOM_ATOM, 0, 1024);
+
+    xcb_get_window_attributes_reply_t *a =
+        xcb_get_window_attributes_reply(conn, a_ck, NULL);
     if (!a)
         return;
     int viewable = !a->override_redirect && a->map_state == XCB_MAP_STATE_VIEWABLE;
     free(a);
     if (!viewable)
         return;
-    if (class_excluded(win) || !type_allowed(win))
+    if (class_excluded_ck(xcb_get_property(conn, 0, win, XCB_ATOM_WM_CLASS,
+                                          XCB_ATOM_STRING, 0, 256)) ||
+        !type_allowed_ck(xcb_get_property(conn, 0, win, atoms[A_NET_WM_WINDOW_TYPE],
+                                         XCB_ATOM_ATOM, 0, 1024)))
         return;
 
-    xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, win), NULL);
+    xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(conn, g_ck, NULL);
     if (!g)
         return;
-    xcb_translate_coordinates_reply_t *tr = xcb_translate_coordinates_reply(
-        conn, xcb_translate_coordinates(conn, win, screen->root, 0, 0), NULL);
+    xcb_translate_coordinates_reply_t *tr =
+        xcb_translate_coordinates_reply(conn, tr_ck, NULL);
     if (!tr) {
         free(g);
         return;
@@ -1120,8 +1137,9 @@ static void add_client(xcb_window_t win)
     xcb_change_window_attributes(conn, win, XCB_CW_EVENT_MASK, &propmask);
 
     apply_geometry(c);
-    if (!has_state(win, atoms[A_NET_WM_STATE_FULLSCREEN]) &&
-        !has_state(win, atoms[A_NET_WM_STATE_HIDDEN])) {
+    const xcb_atom_t hidden_states[2] = { atoms[A_NET_WM_STATE_FULLSCREEN],
+                                          atoms[A_NET_WM_STATE_HIDDEN] };
+    if (!state_has_any(st_ck, hidden_states, 2)) {
         xcb_map_window(conn, c->frame);
         c->mapped = 1;
         stack_above_client(c);
@@ -1135,19 +1153,25 @@ static void add_client(xcb_window_t win)
 
 static void update_client(client_t *c)
 {
-    xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, c->win), NULL);
+    /* Fire all queries before reading replies so the roundtrips overlap. */
+    xcb_get_geometry_cookie_t g_ck = xcb_get_geometry(conn, c->win);
+    xcb_translate_coordinates_cookie_t tr_ck =
+        xcb_translate_coordinates(conn, c->win, screen->root, 0, 0);
+    xcb_get_window_attributes_cookie_t a_ck = xcb_get_window_attributes(conn, c->win);
+
+    xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(conn, g_ck, NULL);
     if (!g) {
         remove_client_at((size_t)(c - clients));
         return;
     }
-    xcb_translate_coordinates_reply_t *tr = xcb_translate_coordinates_reply(
-        conn, xcb_translate_coordinates(conn, c->win, screen->root, 0, 0), NULL);
+    xcb_translate_coordinates_reply_t *tr =
+        xcb_translate_coordinates_reply(conn, tr_ck, NULL);
     if (!tr) {
         free(g);
         return;
     }
-    xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(
-        conn, xcb_get_window_attributes(conn, c->win), NULL);
+    xcb_get_window_attributes_reply_t *a =
+        xcb_get_window_attributes_reply(conn, a_ck, NULL);
     if (!a) {
         free(g);
         free(tr);

@@ -18,8 +18,8 @@ CUT = 7
 THICK = 3
 
 COLORS = {
-    "hud-40-focused.png": "#ffffff",
-    "hud-40-unfocused.png": "#6e7681",
+    "hud-40-focused-white.png": "#ffffff",
+    "hud-40-unfocused-black.png": "#6e7681",
 }
 
 
