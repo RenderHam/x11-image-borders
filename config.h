@@ -7,8 +7,8 @@
 
 /* Border images. PNG only. Relative paths are tried against the working
  * directory first, then the executable's directory. */
-static const char *focused_image   = "assets/hud-512-focused.png";
-static const char *unfocused_image = "assets/hud-512-unfocused.png";
+static const char *focused_image   = "/home/kuuki/Project/x11-image-borders/assets/hud-512-focused.png";
+static const char *unfocused_image = "/home/kuuki/Project/x11-image-borders/assets/hud-512-unfocused.png";
 
 /* Required square size of both border images, in pixels. xib refuses to
  * start if a loaded PNG has another size. Set it to the template you use:
